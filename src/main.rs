@@ -6,81 +6,51 @@ use std::collections::HashSet;
 use std::error::Error;
 use regex::Regex;
 use clap::{Parser};
+use std::process::{Command, Stdio};
 
-fn find_library_path(lib_name: &str, mut user_path: Vec<&str>) -> Option<PathBuf> {
-    // Check the system's library search paths (e.g., /lib, /usr/lib, etc.)
-    let mut system_paths = vec!["/lib", "/usr/lib", "/lib64", "/usr/lib64", "/usr/local/lib"];
-    if user_path.len() > 0 {
-        system_paths.append(&mut user_path);
-    }
-    for path in system_paths {
-        let lib_path = Path::new(path).join(lib_name);
-        if lib_path.exists() {
-            return Some(lib_path);
+fn get_ldd_dependencies(executable: &str) -> Vec<String> {
+    let output = Command::new("ldd")
+        .arg(executable)
+        .stdout(Stdio::piped())
+        .output()
+        .expect("Failed to execute ldd");
+
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    let mut dependencies = Vec::new();
+
+    // 创建正则表达式，用于移除路径后面的内存地址部分
+    let re = Regex::new(r"\s+\(.*\)$").unwrap();
+
+    for line in output_str.lines() {
+        // 只处理格式类似 "libname => /path/to/lib" 或 "libname => not found" 的行
+        if let Some(pos) = line.find("=>") {
+            let path = &line[pos + 3..].trim(); // 获取 "=>" 后面的路径部分
+            // 使用正则表达式移除内存地址部分
+            let clean_path = re.replace_all(path, "");
+            dependencies.push(clean_path.to_string());
         }
     }
-
-    // Check LD_LIBRARY_PATH environment variable
-    if let Ok(ld_path) = env::var("LD_LIBRARY_PATH") {
-        for path in ld_path.split(':') {
-            let lib_path = Path::new(path).join(lib_name);
-            if lib_path.exists() {
-                return Some(lib_path);
-            }
-        }
-    }
-
-    None
+    dependencies
 }
 
-fn extract_dependencies(elf_data: &[u8]) -> Vec<String> {
-    let elf = Elf::parse(elf_data).expect("Failed to parse ELF file");
-    elf.libraries.iter().map(|lib| lib.to_string()).collect()
-}
-
-fn resolve_dependencies_recursively(
-    executable_path: &str,
-    processed: &mut HashSet<String>,
-) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
-    // Avoid processing the same library multiple times
-    if processed.contains(executable_path) {
-        return Ok(processed.clone());
-    }
-
-    let elf_data = fs::read(executable_path)?;
-    let dependencies = extract_dependencies(&elf_data);
-
-    for dep in dependencies {
-        if !processed.contains(&dep) {
-            processed.insert(dep.clone());
-            // Recursively resolve dependencies of the found library
-            resolve_dependencies_recursively(&dep, processed)?;
-        }
-    }
-
-    Ok(processed.clone())
-}
-
-fn copy_libraries(libraries: &HashSet<String>, target_dir: &str, search_path: Vec<&str>) -> Result<(), Box<dyn std::error::Error>> {
+fn copy_libraries(libraries: &HashSet<String>, target_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
     for lib in libraries {
-        if let Some(dep_path) = find_library_path(lib, search_path.clone()) {
+        let dep_path = Path::new(lib);
 
-            // Copy the library to the target directory
-            let target_path = Path::new(target_dir).join(dep_path.file_name().unwrap());
-            println!("{} => {}", dep_path.display(), target_path.display());
-            fs::copy(dep_path, target_path)?;
+        // Copy the library to the target directory
+        let target_path = Path::new(target_dir).join(dep_path.file_name().unwrap());
+        println!("{} => {}", dep_path.display(), target_path.display());
+        fs::copy(dep_path, target_path)?;
 
-        } else {
-            println!("Library {} not found", lib);
-        }
     }
 
     Ok(())
 }
 
 fn resolve_dependencies(executable_path: &str) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
-    let mut processed = HashSet::new();
-    let mut all_dependencies = resolve_dependencies_recursively(executable_path, &mut processed)?;
+    let  all_dependencies = get_ldd_dependencies(executable_path);
+
+    let mut result = all_dependencies.into_iter().collect::<HashSet<String>>();
 
     // Define the ignore list patterns
     let ignore_patterns = vec![
@@ -90,11 +60,11 @@ fn resolve_dependencies(executable_path: &str) -> Result<HashSet<String>, Box<dy
     ];
 
     // Filter out dependencies that match the ignore list patterns
-    all_dependencies.retain(|dep| {
+    result.retain(|dep| {
         !ignore_patterns.iter().any(|regex| regex.is_match(dep))
     });
     //println!("{:?}", all_dependencies);
-    Ok(all_dependencies)
+    Ok(result)
 }
 
 // 命令行参数
@@ -108,10 +78,6 @@ struct Args {
     /// Directory where dependencies will be copied (default is "output")
     #[clap(short, long, default_value = "output")]
     target: String,
-
-    /// additional search path for lib
-    #[clap(short, long)]
-    search: Option<String>,
 
 }
 
@@ -178,14 +144,11 @@ fn main() {
     fs::copy(executable_path, Path::new(target_dir)
         .join(exe_filename).to_str().unwrap()).expect("Failed to copy executable");
 
-    let mut user_search_path = Vec::new();
-    let search_path_str = args.search.unwrap();
-    user_search_path.push(search_path_str.as_str());
     match resolve_dependencies(executable_path) {
         Ok(all_dependencies) => {
             copy_libraries(&all_dependencies,
-                           Path::new(target_dir).join("libs").to_str().unwrap(),
-                           user_search_path).expect("Failed to copy library");
+                           Path::new(target_dir).join("libs").to_str().unwrap())
+                .expect("Failed to copy library");
         }
         Err(err) => {
             eprintln!("Error: {}", err);
